@@ -174,26 +174,26 @@ def train_model():
     
     # Create and compile model
     print("Creating model...")
-    vae = ConditionalVAE(latent_dim=20, num_classes=10)
+    vae = ConditionalVAE(latent_dim=10, num_classes=10)  # Smaller latent space for faster training
     vae.compile(optimizer='adam', loss='binary_crossentropy')
     
     # Train the model
     print("Training model...")
     history = vae.fit(
         [images, labels], images,
-        epochs=20,  # Reduced for Raspberry Pi
-        batch_size=128,
+        epochs=5,  # Much faster for quick testing
+        batch_size=256,  # Larger batch size for faster training
         validation_split=0.1,
         verbose=1
     )
     
     # Save the model
     print("Saving model...")
-    vae.save_weights('digit_generator_model.h5')
+    vae.save_weights('digit_generator_model.weights.h5')
     
     # Save model configuration
     model_config = {
-        'latent_dim': 20,
+        'latent_dim': 10,
         'num_classes': 10,
         'input_shape': (28, 28, 1)
     }
@@ -222,4 +222,4 @@ def train_model():
 if __name__ == "__main__":
     # Train the model
     model = train_model()
-    print("Training complete! Model saved as 'digit_generator_model.h5'")
+    print("Training complete! Model saved as 'digit_generator_model.weights.h5'")

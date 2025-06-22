@@ -12,7 +12,7 @@ from tensorflow.keras import layers
 class ConditionalVAE(keras.Model):
     """Conditional Variational Autoencoder for digit generation"""
     
-    def __init__(self, latent_dim=20, num_classes=10, **kwargs):
+    def __init__(self, latent_dim=10, num_classes=10, **kwargs):
         super(ConditionalVAE, self).__init__(**kwargs)
         self.latent_dim = latent_dim
         self.num_classes = num_classes
@@ -58,10 +58,48 @@ class ConditionalVAE(keras.Model):
         combined = tf.concat([z, label_emb], axis=1)
         return self.decoder(combined)
     
-    def generate(self, labels, num_samples=1):
-        """Generate new digit images for given labels"""
-        # Sample from latent space
-        z = tf.random.normal(shape=(num_samples, self.latent_dim))
+    def reparameterize(self, z_mean, z_log_var):
+        batch = tf.shape(z_mean)[0]
+        dim = tf.shape(z_mean)[1]
+        epsilon = tf.keras.backend.random_normal(shape=(batch, dim))
+        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+
+    def call(self, inputs):
+        x, labels = inputs
+        z_mean, z_log_var = self.encode(x, labels)
+        z = self.reparameterize(z_mean, z_log_var)
+        reconstructed = self.decode(z, labels)
+        
+        # Add KL divergence loss
+        kl_loss = -0.5 * tf.reduce_mean(
+            z_log_var - tf.square(z_mean) - tf.exp(z_log_var) + 1
+        )
+        self.add_loss(kl_loss)
+        
+        return reconstructed
+    
+    def generate(self, labels, num_samples=1, diversity_level=2.0):
+        """Generate new digit images for given labels with maximum diversity"""
+        # Use much higher variance for extreme diversity
+        z = tf.random.normal(shape=(num_samples, self.latent_dim), mean=0.0, stddev=diversity_level)
+        
+        # Add multiple layers of randomness for each sample
+        for i in range(num_samples):
+            # Layer 1: High-variance directional noise
+            directional_noise = tf.random.normal(shape=(1, self.latent_dim), mean=0.0, stddev=0.5)
+            
+            # Layer 2: Uniform random noise for different patterns
+            uniform_noise = tf.random.uniform(shape=(1, self.latent_dim), minval=-1.0, maxval=1.0) * 0.3
+            
+            # Layer 3: Sparse noise (some dimensions get extreme values)
+            sparse_mask = tf.random.uniform(shape=(1, self.latent_dim)) < 0.3  # 30% chance
+            sparse_noise = tf.where(sparse_mask, 
+                                  tf.random.normal(shape=(1, self.latent_dim), stddev=1.5), 
+                                  tf.zeros((1, self.latent_dim)))
+            
+            # Combine all noise layers
+            total_noise = directional_noise + uniform_noise + sparse_noise
+            z = tf.tensor_scatter_nd_add(z, [[i]], total_noise)
         
         # Handle labels
         if isinstance(labels, int):
@@ -78,7 +116,7 @@ def load_trained_model():
     """Load the trained VAE model"""
     try:
         # Check if model files exist
-        if not os.path.exists('digit_generator_model.h5'):
+        if not os.path.exists('digit_generator_model.weights.h5'):
             return None, "Model not found. Please train the model first by running exercise-3-back.py"
         
         if not os.path.exists('model_config.pkl'):
@@ -100,7 +138,7 @@ def load_trained_model():
         _ = model([dummy_images, dummy_labels])
         
         # Load weights
-        model.load_weights('digit_generator_model.h5')
+        model.load_weights('digit_generator_model.weights.h5')
         
         return model, "Model loaded successfully!"
         
@@ -108,12 +146,70 @@ def load_trained_model():
         return None, f"Error loading model: {str(e)}"
 
 def generate_digit_images(model, digit, num_examples=5, seed=None):
-    """Generate images for a specific digit using the trained model"""
+    """Generate images for a specific digit using the trained model with maximum diversity"""
     if seed is not None:
         tf.random.set_seed(seed)
     
-    # Generate images
-    generated = model.generate(digit, num_samples=num_examples)
+    # Generate each image individually with different strategies
+    all_images = []
+    diversity_levels = [1.5, 2.0, 2.5, 3.0, 2.2, 1.8, 2.8, 3.2]  # Different levels for each image
+    
+    for i in range(num_examples):
+        # Generate completely different random seeds for each digit
+        if seed is None:
+            # Use very different seeds: timestamp + large prime offsets
+            prime_offsets = [1009, 2017, 3023, 4027, 5039, 6043, 7057, 8069]  # Large primes
+            base_seed = int(tf.timestamp().numpy() * 1000000) % 100000
+            unique_seed = (base_seed + prime_offsets[i % len(prime_offsets)] * (i + 1)) % 999999
+            tf.random.set_seed(unique_seed)
+        else:
+            # For reproducible results, use provided seed with large offsets
+            unique_seed = (seed + i * 10000 + i**2 * 1000) % 999999
+            tf.random.set_seed(unique_seed)
+        
+        # Use varying diversity levels for different "styles"
+        diversity = diversity_levels[i % len(diversity_levels)]
+        
+        # Strategy 1: Single generation with high diversity
+        if i % 3 == 0:
+            generated = model.generate(digit, num_samples=1, diversity_level=diversity)
+            all_images.append(generated[0])
+        
+        # Strategy 2: Generate multiple and pick the most different one
+        elif i % 3 == 1:
+            candidates = model.generate(digit, num_samples=3, diversity_level=diversity)
+            # Pick the candidate that's most different from previous images
+            if len(all_images) > 0:
+                # Simple heuristic: pick the one with most different pixel variance
+                variances = []
+                for candidate in candidates:
+                    # Calculate variance manually: Var(X) = E[X²] - E[X]²
+                    mean_val = tf.reduce_mean(candidate)
+                    variance = tf.reduce_mean(tf.square(candidate - mean_val))
+                    variances.append(variance.numpy())
+                
+                best_idx = np.argmax(variances) if i % 2 == 0 else np.argmin(variances)
+                all_images.append(candidates[best_idx])
+            else:
+                all_images.append(candidates[0])
+        
+        # Strategy 3: Interpolated generation
+        else:
+            # Generate two extreme points and interpolate between them
+            z1 = tf.random.normal(shape=(1, model.latent_dim), stddev=diversity)
+            z2 = tf.random.normal(shape=(1, model.latent_dim), stddev=diversity)
+            
+            # Random interpolation factor
+            alpha = tf.random.uniform([], minval=0.2, maxval=0.8)
+            z_interp = alpha * z1 + (1 - alpha) * z2
+            
+            # Decode with label
+            labels = tf.constant([digit])
+            generated = model.decode(z_interp, labels)
+            all_images.append(generated[0])
+    
+    # Stack all images
+    generated = tf.stack(all_images)
     
     # Convert to numpy and ensure proper range [0, 1]
     images = generated.numpy()
@@ -241,7 +337,7 @@ def main():
             - Generated Images: **{len(st.session_state.generated_images)}**
             - Target Digit: **{digit}**
             - Image Resolution: **28x28 pixels**
-            - Latent Dimensions: **20**
+            - Latent Dimensions: **10**
             """)
             
             # Add download option
